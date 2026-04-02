@@ -143,16 +143,12 @@ def invalidate_strings_cache():
 # generous upper bound for a single string literal.
 _STR_LOOKBACK_BYTES = 1024
 
-# IDA string-type constant for 4-byte-char C strings (UTF-32LE).
-# Guarded with getattr for older IDA builds that may not expose it.
-_STRTYPE_C_32 = getattr(ida_nalt, "STRTYPE_C_32", 0x50000000)
-
-# Per-mode config: (python_codec, IDA_strtype, char_size_bytes)
+# Per-mode config: (python_codec, char_size_bytes)
 # "UTF-8" is handled separately via the IDA string cache.
-_ENCODING_CONFIGS: dict[str, tuple[str, int, int]] = {
-    "UTF-16LE":    ("utf-16-le", ida_nalt.STRTYPE_C_16, 2),
-    "UTF-32LE":    ("utf-32-le", _STRTYPE_C_32,         4),
-    "windows-1252": ("cp1252",   ida_nalt.STRTYPE_C,     1),
+_ENCODING_CONFIGS: dict[str, tuple[str, int]] = {
+    "UTF-16LE":    ("utf-16-le", 2),
+    "UTF-32LE":    ("utf-32-le", 4),
+    "windows-1252": ("cp1252",   1),
 }
 
 
@@ -242,13 +238,33 @@ def _find_encoded_string_start(hit_ea: int, char_size: int) -> int:
             return ea - lookback + pos + char_size
         pos -= char_size
 
-    return ea - lookback
+    return ea  # best fallback: the hit itself is known to be inside the string
+
+
+def _read_null_terminated_encoded(ea: int, char_size: int, max_chars: int = 4096) -> bytes | None:
+    """Read raw bytes of a null-terminated encoded string starting at *ea*.
+
+    Scans forward from *ea* in steps of *char_size* looking for the null
+    terminator (``char_size`` consecutive zero bytes).  Returns the string
+    bytes **without** the null terminator, or ``None`` if *ea* is not mapped
+    or the string exceeds *max_chars* characters without a terminator.
+
+    This helper reads raw bytes directly from the binary without requiring
+    the address to be annotated as a string in the IDB.
+    """
+    raw = ida_bytes.get_bytes(ea, max_chars * char_size)
+    if not raw or len(raw) < char_size:
+        return None
+    null = b"\x00" * char_size
+    for i in range(0, len(raw) - char_size + 1, char_size):
+        if raw[i : i + char_size] == null:
+            return raw[:i] if i > 0 else None
+    return None
 
 
 def _search_encoded(
     regex: re.Pattern,
     encoding: str,
-    strtype: int,
     char_size: int,
     max_count: int,
 ) -> list[tuple[int, str]]:
@@ -256,13 +272,11 @@ def _search_encoded(
 
     Encodes the longest literal run extracted from the pattern, searches for
     it as raw bytes, walks back to each string's start, decodes the full
-    string via ``ida_bytes.get_strlit_contents``, and applies the regex.
+    string via direct byte reads, and applies the regex.
 
     Args:
         regex:      Compiled regex (with ``re.IGNORECASE``) to filter results.
         encoding:   Python codec name (e.g. ``"utf-16-le"``, ``"cp1252"``).
-        strtype:    IDA string-type constant (e.g. ``ida_nalt.STRTYPE_C_16``)
-                    used to read the full null-terminated string at each hit.
         char_size:  Byte width of one character in *encoding* (1, 2, or 4).
         max_count:  Maximum number of matching ``(ea, text)`` pairs to return.
 
@@ -296,14 +310,35 @@ def _search_encoded(
         str_start = _find_encoded_string_start(hit, char_size)
         if str_start not in seen:
             seen.add(str_start)
-            content = ida_bytes.get_strlit_contents(str_start, -1, strtype)
+
+            # Try decoding the full string from the backward-scan start.
+            # If that fails (str_start landed inside code with invalid byte
+            # sequences), fall back to reading forward from the literal hit.
+            report_ea = str_start
+            text: str | None = None
+
+            content = _read_null_terminated_encoded(str_start, char_size)
             if content:
                 try:
                     text = content.decode(encoding)
-                    if regex.search(text):
-                        results.append((str_start, text))
                 except (UnicodeDecodeError, ValueError):
                     pass
+
+            if text is None and str_start != hit:
+                # str_start is probably inside non-string bytes; the hit
+                # address itself is a safe fallback since we know the needle
+                # is there.
+                content = _read_null_terminated_encoded(hit, char_size)
+                if content:
+                    try:
+                        text = content.decode(encoding)
+                        report_ea = hit
+                        seen.add(hit)
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+
+            if text is not None and regex.search(text):
+                results.append((report_ea, text))
 
         ea = hit + char_size  # advance past current hit
 
@@ -1076,8 +1111,8 @@ def find_regex(
         ]
 
     def _encoded_matches(enc_mode: str) -> list[tuple[int, str]]:
-        codec, strtype, char_size = _ENCODING_CONFIGS[enc_mode]
-        return _search_encoded(regex, codec, strtype, char_size, need)
+        codec, char_size = _ENCODING_CONFIGS[enc_mode]
+        return _search_encoded(regex, codec, char_size, need)
 
     if mode == "UTF-8":
         all_matches: list[tuple[int, str]] = _utf8_matches()

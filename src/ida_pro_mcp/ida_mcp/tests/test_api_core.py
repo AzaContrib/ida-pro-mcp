@@ -15,6 +15,7 @@ from ..framework import (
     optional,
     get_any_function,
     get_data_address,
+    get_unmapped_address,
 )
 from ..utils import Function, ConvertedNumber
 from ..api_core import (
@@ -31,6 +32,7 @@ from ..api_core import (
     find_regex,
     _extract_longest_literal,
     _find_encoded_string_start,
+    _read_null_terminated_encoded,
 )
 
 
@@ -539,6 +541,39 @@ def test_find_encoded_string_start_utf16_alignment():
 
 
 # ============================================================================
+# Unit tests for _read_null_terminated_encoded
+# ============================================================================
+
+
+@test()
+def test_read_null_terminated_encoded_unmapped_returns_none():
+    """_read_null_terminated_encoded returns None for an unmapped address."""
+    unmapped = int(get_unmapped_address(), 16)
+    result = _read_null_terminated_encoded(unmapped, 1)
+    assert result is None, (
+        f"Expected None for unmapped address, got {result!r}"
+    )
+
+
+@test()
+def test_read_null_terminated_encoded_finds_utf8_string():
+    """_read_null_terminated_encoded reads a known UTF-8 string (char_size=1)."""
+    import idautils
+
+    strings = [s for s in idautils.Strings() if s is not None and len(str(s)) >= 3]
+    if not strings:
+        skip_test("binary has no strings of length >= 3")
+
+    s = strings[0]
+    expected = str(s)
+    content = _read_null_terminated_encoded(s.ea, 1)
+    assert content is not None, f"Expected bytes at {hex(s.ea)}, got None"
+    # The decoded bytes must contain the IDA-reported string text.
+    text = content.decode("latin-1", errors="replace")
+    assert expected in text, f"Expected '{expected}' inside '{text}'"
+
+
+# ============================================================================
 # Tests for find_regex mode parameter
 # ============================================================================
 
@@ -621,3 +656,76 @@ def test_find_regex_utf8_matches_known_crackme_strings():
     by_addr = {item["addr"]: item["string"] for item in result["matches"]}
     assert by_addr.get("0x201f") == "Yes, %s is correct!\n"
     assert by_addr.get("0x2034") == "No, %s is not correct.\n"
+
+
+# ============================================================================
+# Tests for find_regex UTF-16LE mode against wide_fixture.elf
+# ============================================================================
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_finds_get_user_name():
+    """find_regex mode='UTF-16LE' finds the 'GetUserName' wide string."""
+    result = find_regex("GetUserName", mode="UTF-16LE")
+    assert_shape(
+        result,
+        {
+            "n": int,
+            "matches": list_of({"addr": is_hex_address, "string": str}, min_length=1),
+            "cursor": dict,
+        },
+    )
+    strings = [m["string"] for m in result["matches"]]
+    assert any("GetUserName" in s for s in strings), (
+        f"Expected 'GetUserName' in one of {strings}"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_finds_hello_world():
+    """find_regex mode='UTF-16LE' finds 'Hello, World!' via prefix pattern."""
+    result = find_regex("Hello", mode="UTF-16LE")
+    assert result["n"] >= 1, "Expected at least one match for 'Hello'"
+    strings = [m["string"] for m in result["matches"]]
+    assert any("Hello" in s for s in strings), (
+        f"Expected 'Hello' in one of {strings}"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_finds_windows_path():
+    """find_regex mode='UTF-16LE' finds the Windows path wide string."""
+    result = find_regex("Windows", mode="UTF-16LE")
+    assert result["n"] >= 1, "Expected at least one match for 'Windows'"
+    strings = [m["string"] for m in result["matches"]]
+    assert any("Windows" in s for s in strings), (
+        f"Expected 'Windows' in one of {strings}"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_case_insensitive():
+    """find_regex mode='UTF-16LE' matches case-insensitively."""
+    lower_result = find_regex("getuSERname", mode="UTF-16LE")
+    assert lower_result["n"] >= 1, (
+        "Case-insensitive search for 'getuSERname' should match 'GetUserName'"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_no_match_for_absent_pattern():
+    """find_regex mode='UTF-16LE' returns empty for a string not in the binary."""
+    result = find_regex("zZzZzZ_not_present_xXxXxX", mode="UTF-16LE")
+    assert result["n"] == 0
+    assert result["matches"] == []
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_all_mode_includes_utf16le_strings():
+    """find_regex mode='All' returns wide strings from wide_fixture.elf."""
+    result = find_regex("GetUserName", mode="All")
+    strings = [m["string"] for m in result["matches"]]
+    assert any("GetUserName" in s for s in strings), (
+        "mode='All' should include UTF-16LE wide strings"
+    )
+
