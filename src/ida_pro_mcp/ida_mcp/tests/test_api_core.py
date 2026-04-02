@@ -29,6 +29,7 @@ from ..api_core import (
     server_health,
     server_warmup,
     find_regex,
+    _extract_longest_literal,
 )
 
 
@@ -466,3 +467,53 @@ def test_find_regex():
     """find_regex can search for patterns"""
     result = find_regex(".*")
     assert_has_keys(result, "matches", "cursor")
+
+
+# ============================================================================
+# Unit tests for UTF-16LE helpers (no IDA runtime required)
+# ============================================================================
+
+
+@test()
+def test_extract_longest_literal_plain():
+    """_extract_longest_literal returns the whole string for a plain literal."""
+    assert _extract_longest_literal("GWorld") == "GWorld"
+
+
+@test()
+def test_extract_longest_literal_wildcards():
+    """_extract_longest_literal picks the longest literal run past wildcards."""
+    assert _extract_longest_literal(".*GEngine.*") == "GEngine"
+
+
+@test()
+def test_extract_longest_literal_anchors():
+    """_extract_longest_literal ignores regex anchors."""
+    assert _extract_longest_literal("^Hello$") == "Hello"
+
+
+@test()
+def test_extract_longest_literal_word_boundary():
+    """_extract_longest_literal is not fooled by \\b word-boundary escapes."""
+    assert _extract_longest_literal(r"\bGWorld\b") == "GWorld"
+
+
+@test()
+def test_extract_longest_literal_character_class():
+    """_extract_longest_literal picks the literal tail after a character class."""
+    assert _extract_longest_literal("[Uu]nreal") == "nreal"
+
+
+@test()
+def test_extract_longest_literal_alternation():
+    """_extract_longest_literal returns the longest branch of an alternation."""
+    result = _extract_longest_literal("(hello|world)")
+    assert result in ("hello", "world")
+    assert len(result) == 5
+
+
+@test()
+def test_extract_longest_literal_short_returns_empty():
+    """_extract_longest_literal returns a string of length < 2 for pure wildcards."""
+    result = _extract_longest_literal(".*")
+    assert len(result) < 2
