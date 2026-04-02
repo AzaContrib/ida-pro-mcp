@@ -30,6 +30,7 @@ from ..api_core import (
     server_warmup,
     find_regex,
     _extract_longest_literal,
+    _find_encoded_string_start,
 )
 
 
@@ -514,6 +515,109 @@ def test_extract_longest_literal_alternation():
 
 @test()
 def test_extract_longest_literal_short_returns_empty():
-    """_extract_longest_literal returns a string of length < 2 for pure wildcards."""
+    """_extract_longest_literal returns an empty string for pure wildcards."""
     result = _extract_longest_literal(".*")
-    assert len(result) < 2
+    assert result == "", f"expected empty string for '.*', got {result!r}"
+
+
+# ============================================================================
+# Unit tests for _find_encoded_string_start (no IDA runtime required)
+# ============================================================================
+
+
+@test()
+def test_find_encoded_string_start_utf16_alignment():
+    """_find_encoded_string_start aligns odd addresses to 2-byte boundary."""
+    import idaapi
+    import ida_bytes
+
+    # We can only test the alignment logic portably; deeper tests run in IDA.
+    # Passing an odd address should return an even address.
+    # (With a tiny ea the look-back window is 0, so it falls through to ea.)
+    result = _find_encoded_string_start(1, 2)
+    assert result % 2 == 0, "result must be 2-byte aligned for char_size=2"
+
+
+# ============================================================================
+# Tests for find_regex mode parameter
+# ============================================================================
+
+
+@test()
+def test_find_regex_default_mode_utf8():
+    """find_regex default mode searches strings and returns valid structure."""
+    result = find_regex(".*")
+    assert_has_keys(result, "matches", "cursor")
+
+
+@test()
+def test_find_regex_explicit_utf8_mode():
+    """find_regex mode='UTF-8' is equivalent to the default."""
+    result = find_regex(".*", mode="UTF-8")
+    assert_has_keys(result, "matches", "cursor")
+
+
+@test()
+def test_find_regex_utf16le_mode_returns_valid_structure():
+    """find_regex mode='UTF-16LE' returns valid result structure."""
+    result = find_regex(".*", mode="UTF-16LE")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_utf32le_mode_returns_valid_structure():
+    """find_regex mode='UTF-32LE' returns valid result structure."""
+    result = find_regex(".*", mode="UTF-32LE")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_windows1252_mode_returns_valid_structure():
+    """find_regex mode='windows-1252' returns valid result structure."""
+    result = find_regex(".*", mode="windows-1252")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_all_mode_returns_valid_structure():
+    """find_regex mode='All' returns valid result structure."""
+    result = find_regex(".*", mode="All")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_invalid_mode_returns_error():
+    """find_regex returns an error dict for unknown mode values."""
+    result = find_regex(".*", mode="latin-1")
+    assert_has_keys(result, "error")
+    assert result["n"] == 0
+    assert result["matches"] == []
+
+
+@test()
+def test_find_regex_all_mode_no_duplicate_addresses():
+    """find_regex mode='All' does not return duplicate addresses."""
+    result = find_regex(".*", limit=100, mode="All")
+    addrs = [m["addr"] for m in result["matches"]]
+    assert len(addrs) == len(set(addrs)), "All mode must deduplicate by address"
+
+
+@test(binary="crackme03.elf")
+def test_find_regex_utf8_matches_known_crackme_strings():
+    """find_regex mode='UTF-8' still finds the known crackme correct strings."""
+    result = find_regex("correct", mode="UTF-8")
+    assert_shape(
+        result,
+        {
+            "n": int,
+            "matches": list_of({"addr": is_hex_address, "string": str}, min_length=1),
+            "cursor": dict,
+        },
+    )
+    by_addr = {item["addr"]: item["string"] for item in result["matches"]}
+    assert by_addr.get("0x201f") == "Yes, %s is correct!\n"
+    assert by_addr.get("0x2034") == "No, %s is not correct.\n"

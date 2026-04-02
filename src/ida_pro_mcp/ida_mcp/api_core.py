@@ -135,17 +135,25 @@ def invalidate_strings_cache():
 
 
 # ============================================================================
-# UTF-16LE search helpers
+# Encoded-string binary search helpers
 # ============================================================================
 
-# Maximum number of bytes to scan backwards when locating the start of a
-# UTF-16LE string from an interior binary-search hit.  512 UTF-16 characters
-# (1 024 bytes) is a generous upper bound for a single string literal; raising
-# it increases accuracy at the cost of more memory per call.
-_UTF16_LOOKBACK_BYTES = 1024
+# Maximum bytes to scan backwards from a binary-search hit to find the start
+# of the enclosing string.  1 024 bytes == 512 UTF-16 chars, which is a
+# generous upper bound for a single string literal.
+_STR_LOOKBACK_BYTES = 1024
 
-# Byte width of a single UTF-16 code unit.
-_UTF16_CHAR_SIZE = 2
+# IDA string-type constant for 4-byte-char C strings (UTF-32LE).
+# Guarded with getattr for older IDA builds that may not expose it.
+_STRTYPE_C_32 = getattr(ida_nalt, "STRTYPE_C_32", 0x50000000)
+
+# Per-mode config: (python_codec, IDA_strtype, char_size_bytes)
+# "UTF-8" is handled separately via the IDA string cache.
+_ENCODING_CONFIGS: dict[str, tuple[str, int, int]] = {
+    "UTF-16LE":    ("utf-16-le", ida_nalt.STRTYPE_C_16, 2),
+    "UTF-32LE":    ("utf-32-le", _STRTYPE_C_32,         4),
+    "windows-1252": ("cp1252",   ida_nalt.STRTYPE_C,     1),
+}
 
 
 def _extract_longest_literal(pattern: str) -> str:
@@ -155,6 +163,9 @@ def _extract_longest_literal(pattern: str) -> str:
     sequences like ``\\b`` or ``\\d`` are never mistakenly treated as literal
     characters.  BRANCH nodes (alternations) are explored and the longest
     literal found in any branch is returned.
+
+    Returns the longest contiguous literal substring found in *pattern*, or an
+    empty string when no literal run of any length exists (e.g. ``".*"``).
     """
     try:
         parsed = sre_parse.parse(pattern)
@@ -165,7 +176,18 @@ def _extract_longest_literal(pattern: str) -> str:
 
 
 def _best_literal_in(items: sre_parse.SubPattern) -> str:
-    """Return the longest contiguous literal run inside *items*."""
+    """Return the longest contiguous literal run inside a parsed regex *items*.
+
+    Recursively descends into SUBPATTERN (groups) and BRANCH (alternations)
+    nodes, tracking the current run of consecutive LITERAL opcodes.  Non-
+    literal opcodes flush the current run and reset it.
+
+    Args:
+        items: A parsed ``sre_parse.SubPattern`` sequence of ``(opcode, arg)`` pairs.
+
+    Returns:
+        The longest contiguous literal string found, or ``""`` if none.
+    """
     best = ""
     run: list[str] = []
 
@@ -196,50 +218,66 @@ def _best_literal_in(items: sre_parse.SubPattern) -> str:
     return best
 
 
-def _find_utf16_string_start(hit_ea: int) -> int:
-    """Return the start address of the UTF-16LE string that contains *hit_ea*.
+def _find_encoded_string_start(hit_ea: int, char_size: int) -> int:
+    """Return the start address of the encoded string that contains *hit_ea*.
 
-    Scans backwards (up to 1 024 bytes) for a null word ``0x0000`` that marks
-    the end of the preceding string.  The address immediately following that
-    null word is returned as the string start.  Falls back to *hit_ea* itself
-    when no null word is found in the look-back window.
+    Scans backwards (up to ``_STR_LOOKBACK_BYTES``) for a run of *char_size*
+    zero bytes that marks the terminator of the preceding string.  The address
+    immediately following that terminator is returned.  Falls back to *hit_ea*
+    (aligned) when no terminator is found in the look-back window.
     """
-    # Align to 2-byte word boundary
-    ea = hit_ea & ~(_UTF16_CHAR_SIZE - 1)
-    lookback = min(ea, _UTF16_LOOKBACK_BYTES)
-    if lookback < _UTF16_CHAR_SIZE:
+    ea = hit_ea & ~(char_size - 1)  # align to char boundary
+    lookback = min(ea, _STR_LOOKBACK_BYTES)
+    if lookback < char_size:
         return ea
 
     raw = ida_bytes.get_bytes(ea - lookback, lookback)
-    if not raw or len(raw) < _UTF16_CHAR_SIZE:
+    if not raw or len(raw) < char_size:
         return ea
 
-    # Scan right-to-left for a null word (the terminator of the prior string)
-    pos = lookback - _UTF16_CHAR_SIZE
+    # Scan right-to-left for a null char (char_size zero bytes)
+    pos = lookback - char_size
     while pos >= 0:
-        if raw[pos] == 0 and raw[pos + 1] == 0:
-            return ea - lookback + pos + _UTF16_CHAR_SIZE
-        pos -= _UTF16_CHAR_SIZE
+        if all(raw[pos + i] == 0 for i in range(char_size)):
+            return ea - lookback + pos + char_size
+        pos -= char_size
 
     return ea - lookback
 
 
-def _search_utf16le(
-    regex: re.Pattern, max_count: int
+def _search_encoded(
+    regex: re.Pattern,
+    encoding: str,
+    strtype: int,
+    char_size: int,
+    max_count: int,
 ) -> list[tuple[int, str]]:
-    """Search the binary for UTF-16LE strings matching *regex*.
+    """Binary-search the binary for strings in *encoding* that match *regex*.
 
-    Extracts the longest literal run from the pattern, binary-searches for its
-    UTF-16LE encoding, walks back to each string's start, decodes the full
-    string, and applies the regex filter.
+    Encodes the longest literal run extracted from the pattern, searches for
+    it as raw bytes, walks back to each string's start, decodes the full
+    string via ``ida_bytes.get_strlit_contents``, and applies the regex.
 
-    Returns up to *max_count* ``(ea, text)`` pairs.
+    Args:
+        regex:      Compiled regex (with ``re.IGNORECASE``) to filter results.
+        encoding:   Python codec name (e.g. ``"utf-16-le"``, ``"cp1252"``).
+        strtype:    IDA string-type constant (e.g. ``ida_nalt.STRTYPE_C_16``)
+                    used to read the full null-terminated string at each hit.
+        char_size:  Byte width of one character in *encoding* (1, 2, or 4).
+        max_count:  Maximum number of matching ``(ea, text)`` pairs to return.
+
+    Returns:
+        Up to *max_count* ``(ea, text)`` pairs sorted by discovery order.
     """
     literal = _extract_longest_literal(regex.pattern)
     if len(literal) < 2:
         return []
 
-    needle = literal.encode("utf-16-le")
+    try:
+        needle = literal.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return []
+
     mask = b"\xff" * len(needle)
     search_flags = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
 
@@ -255,21 +293,19 @@ def _search_utf16le(
         if hit == idaapi.BADADDR:
             break
 
-        str_start = _find_utf16_string_start(hit)
+        str_start = _find_encoded_string_start(hit, char_size)
         if str_start not in seen:
             seen.add(str_start)
-            content = ida_bytes.get_strlit_contents(
-                str_start, -1, ida_nalt.STRTYPE_C_16
-            )
+            content = ida_bytes.get_strlit_contents(str_start, -1, strtype)
             if content:
                 try:
-                    text = content.decode("utf-16-le")
+                    text = content.decode(encoding)
                     if regex.search(text):
                         results.append((str_start, text))
                 except (UnicodeDecodeError, ValueError):
                     pass
 
-        ea = hit + _UTF16_CHAR_SIZE  # advance past current hit to find the next one
+        ea = hit + char_size  # advance past current hit
 
     return results
 
@@ -990,32 +1026,77 @@ def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
     limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    mode: Annotated[
+        str,
+        (
+            'Encoding to search. "UTF-8" (default) searches the IDA ASCII/UTF-8 string '
+            'cache. "UTF-16LE" searches wide strings (Windows, Unreal Engine). '
+            '"UTF-32LE" searches 4-byte wide strings. '
+            '"windows-1252" searches single-byte ANSI strings using the Windows-1252 '
+            'codepage. "All" searches every encoding and merges the results.'
+        ),
+    ] = "UTF-8",
 ) -> FindRegexResult:
     """Search strings by case-insensitive regex with offset/limit pagination.
 
-    Searches the ASCII string cache first.  When the pattern produces no ASCII
-    matches, a UTF-16LE binary scan is used as a fallback so that wide strings
-    (common in Windows and Unreal Engine binaries) are also covered.
+    Use ``mode`` to target the encoding used by strings in the binary:
+
+    * ``"UTF-8"`` (default) – searches IDA's built-in ASCII/UTF-8 string cache.
+      Fast and sufficient for most ELF/Mach-O binaries.
+    * ``"UTF-16LE"`` – binary-scans for wide strings (2-byte chars).  Essential
+      for Windows PE files and Unreal Engine binaries where all ``TCHAR*``/
+      ``FString`` literals are UTF-16LE.
+    * ``"UTF-32LE"`` – binary-scans for 4-byte-char wide strings.
+    * ``"windows-1252"`` – binary-scans for single-byte ANSI strings encoded in
+      the Windows-1252 code page (covers high bytes 0x80-0xFF not in ASCII).
+    * ``"All"`` – runs every encoding and merges the results (deduplicates by
+      address, sorts by address ascending).
     """
     if limit <= 0:
         limit = 30
     if limit > 500:
         limit = 500
 
+    mode = (mode or "UTF-8").strip()
+    valid_modes = {"UTF-8", "UTF-16LE", "UTF-32LE", "windows-1252", "All"}
+    if mode not in valid_modes:
+        return {
+            "n": 0,
+            "matches": [],
+            "cursor": {"done": True},
+            "error": f"Unknown mode {mode!r}. Valid modes: {sorted(valid_modes)}",
+        }
+
     regex = re.compile(pattern, re.IGNORECASE)
+    need = offset + limit + 1  # collect one extra to detect "more"
 
-    # Phase 1: ASCII string cache (always fast – already built).
-    ascii_matches: list[tuple[int, str]] = [
-        (ea, text) for ea, text in _get_strings_cache() if regex.search(text)
-    ]
+    def _utf8_matches() -> list[tuple[int, str]]:
+        return [
+            (ea, text) for ea, text in _get_strings_cache() if regex.search(text)
+        ]
 
-    # Phase 2: UTF-16LE binary search fallback.
-    # Only triggered when the ASCII cache yields nothing for this pattern so
-    # that normal binaries pay no extra cost.
-    if ascii_matches:
-        all_matches: list[tuple[int, str]] = ascii_matches
-    else:
-        all_matches = _search_utf16le(regex, offset + limit + 1)
+    def _encoded_matches(enc_mode: str) -> list[tuple[int, str]]:
+        codec, strtype, char_size = _ENCODING_CONFIGS[enc_mode]
+        return _search_encoded(regex, codec, strtype, char_size, need)
+
+    if mode == "UTF-8":
+        all_matches: list[tuple[int, str]] = _utf8_matches()
+    elif mode in _ENCODING_CONFIGS:
+        all_matches = _encoded_matches(mode)
+    else:  # "All"
+        seen: set[int] = set()
+        merged: list[tuple[int, str]] = []
+        for ea, text in _utf8_matches():
+            if ea not in seen:
+                seen.add(ea)
+                merged.append((ea, text))
+        for enc_mode in _ENCODING_CONFIGS:
+            for ea, text in _encoded_matches(enc_mode):
+                if ea not in seen:
+                    seen.add(ea)
+                    merged.append((ea, text))
+        merged.sort(key=lambda t: t[0])
+        all_matches = merged
 
     skipped = 0
     matches = []
