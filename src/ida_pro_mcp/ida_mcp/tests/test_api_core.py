@@ -15,6 +15,7 @@ from ..framework import (
     optional,
     get_any_function,
     get_data_address,
+    get_unmapped_address,
 )
 from ..utils import Function, ConvertedNumber
 from ..api_core import (
@@ -29,6 +30,9 @@ from ..api_core import (
     server_health,
     server_warmup,
     find_regex,
+    _extract_longest_literal,
+    _find_encoded_string_start,
+    _read_null_terminated_encoded,
 )
 
 
@@ -466,3 +470,262 @@ def test_find_regex():
     """find_regex can search for patterns"""
     result = find_regex(".*")
     assert_has_keys(result, "matches", "cursor")
+
+
+# ============================================================================
+# Unit tests for UTF-16LE helpers (no IDA runtime required)
+# ============================================================================
+
+
+@test()
+def test_extract_longest_literal_plain():
+    """_extract_longest_literal returns the whole string for a plain literal."""
+    assert _extract_longest_literal("GWorld") == "GWorld"
+
+
+@test()
+def test_extract_longest_literal_wildcards():
+    """_extract_longest_literal picks the longest literal run past wildcards."""
+    assert _extract_longest_literal(".*GEngine.*") == "GEngine"
+
+
+@test()
+def test_extract_longest_literal_anchors():
+    """_extract_longest_literal ignores regex anchors."""
+    assert _extract_longest_literal("^Hello$") == "Hello"
+
+
+@test()
+def test_extract_longest_literal_word_boundary():
+    """_extract_longest_literal is not fooled by \\b word-boundary escapes."""
+    assert _extract_longest_literal(r"\bGWorld\b") == "GWorld"
+
+
+@test()
+def test_extract_longest_literal_character_class():
+    """_extract_longest_literal picks the literal tail after a character class."""
+    assert _extract_longest_literal("[Uu]nreal") == "nreal"
+
+
+@test()
+def test_extract_longest_literal_alternation():
+    """_extract_longest_literal returns the longest branch of an alternation."""
+    result = _extract_longest_literal("(hello|world)")
+    assert result in ("hello", "world")
+    assert len(result) == 5
+
+
+@test()
+def test_extract_longest_literal_short_returns_empty():
+    """_extract_longest_literal returns an empty string for pure wildcards."""
+    result = _extract_longest_literal(".*")
+    assert result == "", f"expected empty string for '.*', got {result!r}"
+
+
+# ============================================================================
+# Unit tests for _find_encoded_string_start (no IDA runtime required)
+# ============================================================================
+
+
+@test()
+def test_find_encoded_string_start_utf16_alignment():
+    """_find_encoded_string_start aligns odd addresses to 2-byte boundary."""
+    import idaapi
+    import ida_bytes
+
+    # We can only test the alignment logic portably; deeper tests run in IDA.
+    # Passing an odd address should return an even address.
+    # (With a tiny ea the look-back window is 0, so it falls through to ea.)
+    result = _find_encoded_string_start(1, 2)
+    assert result % 2 == 0, "result must be 2-byte aligned for char_size=2"
+
+
+# ============================================================================
+# Unit tests for _read_null_terminated_encoded
+# ============================================================================
+
+
+@test()
+def test_read_null_terminated_encoded_unmapped_returns_none():
+    """_read_null_terminated_encoded returns None for an unmapped address."""
+    unmapped = int(get_unmapped_address(), 16)
+    result = _read_null_terminated_encoded(unmapped, 1)
+    assert result is None, (
+        f"Expected None for unmapped address, got {result!r}"
+    )
+
+
+@test()
+def test_read_null_terminated_encoded_finds_utf8_string():
+    """_read_null_terminated_encoded reads a known UTF-8 string (char_size=1)."""
+    import idautils
+
+    strings = [s for s in idautils.Strings() if s is not None and len(str(s)) >= 3]
+    if not strings:
+        skip_test("binary has no strings of length >= 3")
+
+    s = strings[0]
+    expected = str(s)
+    content = _read_null_terminated_encoded(s.ea, 1)
+    assert content is not None, f"Expected bytes at {hex(s.ea)}, got None"
+    # The decoded bytes must contain the IDA-reported string text.
+    text = content.decode("latin-1", errors="replace")
+    assert expected in text, f"Expected '{expected}' inside '{text}'"
+
+
+# ============================================================================
+# Tests for find_regex mode parameter
+# ============================================================================
+
+
+@test()
+def test_find_regex_default_mode_utf8():
+    """find_regex default mode searches strings and returns valid structure."""
+    result = find_regex(".*")
+    assert_has_keys(result, "matches", "cursor")
+
+
+@test()
+def test_find_regex_explicit_utf8_mode():
+    """find_regex mode='UTF-8' is equivalent to the default."""
+    result = find_regex(".*", mode="UTF-8")
+    assert_has_keys(result, "matches", "cursor")
+
+
+@test()
+def test_find_regex_utf16le_mode_returns_valid_structure():
+    """find_regex mode='UTF-16LE' returns valid result structure."""
+    result = find_regex(".*", mode="UTF-16LE")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_utf32le_mode_returns_valid_structure():
+    """find_regex mode='UTF-32LE' returns valid result structure."""
+    result = find_regex(".*", mode="UTF-32LE")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_windows1252_mode_returns_valid_structure():
+    """find_regex mode='windows-1252' returns valid result structure."""
+    result = find_regex(".*", mode="windows-1252")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_all_mode_returns_valid_structure():
+    """find_regex mode='All' returns valid result structure."""
+    result = find_regex(".*", mode="All")
+    assert_has_keys(result, "n", "matches", "cursor")
+    assert isinstance(result["matches"], list)
+
+
+@test()
+def test_find_regex_invalid_mode_returns_error():
+    """find_regex returns an error dict for unknown mode values."""
+    result = find_regex(".*", mode="latin-1")
+    assert_has_keys(result, "error")
+    assert result["n"] == 0
+    assert result["matches"] == []
+
+
+@test()
+def test_find_regex_all_mode_no_duplicate_addresses():
+    """find_regex mode='All' does not return duplicate addresses."""
+    result = find_regex(".*", limit=100, mode="All")
+    addrs = [m["addr"] for m in result["matches"]]
+    assert len(addrs) == len(set(addrs)), "All mode must deduplicate by address"
+
+
+@test(binary="crackme03.elf")
+def test_find_regex_utf8_matches_known_crackme_strings():
+    """find_regex mode='UTF-8' still finds the known crackme correct strings."""
+    result = find_regex("correct", mode="UTF-8")
+    assert_shape(
+        result,
+        {
+            "n": int,
+            "matches": list_of({"addr": is_hex_address, "string": str}, min_length=1),
+            "cursor": dict,
+        },
+    )
+    by_addr = {item["addr"]: item["string"] for item in result["matches"]}
+    assert by_addr.get("0x201f") == "Yes, %s is correct!\n"
+    assert by_addr.get("0x2034") == "No, %s is not correct.\n"
+
+
+# ============================================================================
+# Tests for find_regex UTF-16LE mode against wide_fixture.elf
+# ============================================================================
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_finds_get_user_name():
+    """find_regex mode='UTF-16LE' finds the 'GetUserName' wide string."""
+    result = find_regex("GetUserName", mode="UTF-16LE")
+    assert_shape(
+        result,
+        {
+            "n": int,
+            "matches": list_of({"addr": is_hex_address, "string": str}, min_length=1),
+            "cursor": dict,
+        },
+    )
+    strings = [m["string"] for m in result["matches"]]
+    assert any("GetUserName" in s for s in strings), (
+        f"Expected 'GetUserName' in one of {strings}"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_finds_hello_world():
+    """find_regex mode='UTF-16LE' finds 'Hello, World!' via prefix pattern."""
+    result = find_regex("Hello", mode="UTF-16LE")
+    assert result["n"] >= 1, "Expected at least one match for 'Hello'"
+    strings = [m["string"] for m in result["matches"]]
+    assert any("Hello" in s for s in strings), (
+        f"Expected 'Hello' in one of {strings}"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_finds_windows_path():
+    """find_regex mode='UTF-16LE' finds the Windows path wide string."""
+    result = find_regex("Windows", mode="UTF-16LE")
+    assert result["n"] >= 1, "Expected at least one match for 'Windows'"
+    strings = [m["string"] for m in result["matches"]]
+    assert any("Windows" in s for s in strings), (
+        f"Expected 'Windows' in one of {strings}"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_case_insensitive():
+    """find_regex mode='UTF-16LE' matches case-insensitively."""
+    lower_result = find_regex("getuSERname", mode="UTF-16LE")
+    assert lower_result["n"] >= 1, (
+        "Case-insensitive search for 'getuSERname' should match 'GetUserName'"
+    )
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_utf16le_no_match_for_absent_pattern():
+    """find_regex mode='UTF-16LE' returns empty for a string not in the binary."""
+    result = find_regex("zZzZzZ_not_present_xXxXxX", mode="UTF-16LE")
+    assert result["n"] == 0
+    assert result["matches"] == []
+
+
+@test(binary="wide_fixture.elf")
+def test_find_regex_all_mode_includes_utf16le_strings():
+    """find_regex mode='All' returns wide strings from wide_fixture.elf."""
+    result = find_regex("GetUserName", mode="All")
+    strings = [m["string"] for m in result["matches"]]
+    assert any("GetUserName" in s for s in strings), (
+        "mode='All' should include UTF-16LE wide strings"
+    )
+

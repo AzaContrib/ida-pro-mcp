@@ -288,7 +288,7 @@ http://127.0.0.1:13337/mcp?ext=dbg
 
 ## Pattern Matching & Search
 
-- `find_regex(queries)`: Search strings with case-insensitive regex (paginated).
+- `find_regex(pattern, limit, offset, mode)`: Search strings with case-insensitive regex (paginated). `mode` controls which encoding is searched: `"UTF-8"` (default, IDA ASCII/UTF-8 cache), `"UTF-16LE"` (2-byte wide strings, common in Windows PE / Unreal Engine), `"UTF-32LE"` (4-byte wide strings), `"windows-1252"` (single-byte ANSI), or `"All"` (every encoding, results merged and deduplicated by address).
 - `find_bytes(patterns, limit=1000, offset=0)`: Find byte pattern(s) in binary (e.g., "48 8B ?? ??"). Max limit: 10000.
 - `find_insns(sequences, limit=1000, offset=0)`: Find instruction sequence(s) in code. Max limit: 10000.
 - `find(type, targets, limit=1000, offset=0)`: Advanced search (immediate values, strings, data/code references). Max limit: 10000.

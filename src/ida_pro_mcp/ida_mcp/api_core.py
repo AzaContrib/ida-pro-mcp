@@ -1,11 +1,13 @@
 """Core API Functions - IDB metadata and basic queries"""
 
 import re
+import sre_parse
 import time
 from typing import Annotated, Any, NotRequired, TypedDict
 
 import ida_auto
 import idaapi
+import ida_bytes
 import ida_funcs
 import ida_hexrays
 import idautils
@@ -13,6 +15,8 @@ import ida_loader
 import ida_nalt
 import ida_typeinf
 import idc
+
+from . import compat
 
 from .rpc import tool
 from .sync import idasync
@@ -128,6 +132,217 @@ def invalidate_strings_cache():
     """Clear the strings cache (call after IDB changes)."""
     global _strings_cache
     _strings_cache = None
+
+
+# ============================================================================
+# Encoded-string binary search helpers
+# ============================================================================
+
+# Maximum bytes to scan backwards from a binary-search hit to find the start
+# of the enclosing string.  1 024 bytes == 512 UTF-16 chars, which is a
+# generous upper bound for a single string literal.
+_STR_LOOKBACK_BYTES = 1024
+
+# Per-mode config: (python_codec, char_size_bytes)
+# "UTF-8" is handled separately via the IDA string cache.
+_ENCODING_CONFIGS: dict[str, tuple[str, int]] = {
+    "UTF-16LE":    ("utf-16-le", 2),
+    "UTF-32LE":    ("utf-32-le", 4),
+    "windows-1252": ("cp1252",   1),
+}
+
+
+def _extract_longest_literal(pattern: str) -> str:
+    """Extract the longest contiguous run of literal characters from a regex.
+
+    Uses sre_parse to properly interpret escape sequences so that meta-
+    sequences like ``\\b`` or ``\\d`` are never mistakenly treated as literal
+    characters.  BRANCH nodes (alternations) are explored and the longest
+    literal found in any branch is returned.
+
+    Returns the longest contiguous literal substring found in *pattern*, or an
+    empty string when no literal run of any length exists (e.g. ``".*"``).
+    """
+    try:
+        parsed = sre_parse.parse(pattern)
+    except Exception:
+        return ""
+
+    return _best_literal_in(parsed)
+
+
+def _best_literal_in(items: sre_parse.SubPattern) -> str:
+    """Return the longest contiguous literal run inside a parsed regex *items*.
+
+    Recursively descends into SUBPATTERN (groups) and BRANCH (alternations)
+    nodes, tracking the current run of consecutive LITERAL opcodes.  Non-
+    literal opcodes flush the current run and reset it.
+
+    Args:
+        items: A parsed ``sre_parse.SubPattern`` sequence of ``(opcode, arg)`` pairs.
+
+    Returns:
+        The longest contiguous literal string found, or ``""`` if none.
+    """
+    best = ""
+    run: list[str] = []
+
+    def _flush() -> None:
+        nonlocal best
+        candidate = "".join(run)
+        if len(candidate) > len(best):
+            best = candidate
+        run.clear()
+
+    for op, av in items:
+        if op == sre_parse.LITERAL:
+            run.append(chr(av))
+        elif op == sre_parse.SUBPATTERN:
+            _flush()
+            sub = _best_literal_in(av[-1])
+            if len(sub) > len(best):
+                best = sub
+        elif op == sre_parse.BRANCH:
+            _flush()
+            for branch in av[1]:
+                branch_best = _best_literal_in(branch)
+                if len(branch_best) > len(best):
+                    best = branch_best
+        else:
+            _flush()
+    _flush()
+    return best
+
+
+def _find_encoded_string_start(hit_ea: int, char_size: int) -> int:
+    """Return the start address of the encoded string that contains *hit_ea*.
+
+    Scans backwards (up to ``_STR_LOOKBACK_BYTES``) for a run of *char_size*
+    zero bytes that marks the terminator of the preceding string.  The address
+    immediately following that terminator is returned.  Falls back to *hit_ea*
+    (aligned) when no terminator is found in the look-back window.
+    """
+    ea = hit_ea & ~(char_size - 1)  # align to char boundary
+    lookback = min(ea, _STR_LOOKBACK_BYTES)
+    if lookback < char_size:
+        return ea
+
+    raw = ida_bytes.get_bytes(ea - lookback, lookback)
+    if not raw or len(raw) < char_size:
+        return ea
+
+    # Scan right-to-left for a null char (char_size zero bytes)
+    pos = lookback - char_size
+    while pos >= 0:
+        if all(raw[pos + i] == 0 for i in range(char_size)):
+            return ea - lookback + pos + char_size
+        pos -= char_size
+
+    return ea  # best fallback: the hit itself is known to be inside the string
+
+
+def _read_null_terminated_encoded(ea: int, char_size: int, max_chars: int = 4096) -> bytes | None:
+    """Read raw bytes of a null-terminated encoded string starting at *ea*.
+
+    Scans forward from *ea* in steps of *char_size* looking for the null
+    terminator (``char_size`` consecutive zero bytes).  Returns the string
+    bytes **without** the null terminator, or ``None`` if *ea* is not mapped
+    or the string exceeds *max_chars* characters without a terminator.
+
+    This helper reads raw bytes directly from the binary without requiring
+    the address to be annotated as a string in the IDB.
+    """
+    raw = ida_bytes.get_bytes(ea, max_chars * char_size)
+    if not raw or len(raw) < char_size:
+        return None
+    null = b"\x00" * char_size
+    for i in range(0, len(raw) - char_size + 1, char_size):
+        if raw[i : i + char_size] == null:
+            return raw[:i] if i > 0 else None
+    return None
+
+
+def _search_encoded(
+    regex: re.Pattern,
+    encoding: str,
+    char_size: int,
+    max_count: int,
+) -> list[tuple[int, str]]:
+    """Binary-search the binary for strings in *encoding* that match *regex*.
+
+    Encodes the longest literal run extracted from the pattern, searches for
+    it as raw bytes, walks back to each string's start, decodes the full
+    string via direct byte reads, and applies the regex.
+
+    Args:
+        regex:      Compiled regex (with ``re.IGNORECASE``) to filter results.
+        encoding:   Python codec name (e.g. ``"utf-16-le"``, ``"cp1252"``).
+        char_size:  Byte width of one character in *encoding* (1, 2, or 4).
+        max_count:  Maximum number of matching ``(ea, text)`` pairs to return.
+
+    Returns:
+        Up to *max_count* ``(ea, text)`` pairs sorted by discovery order.
+    """
+    literal = _extract_longest_literal(regex.pattern)
+    if len(literal) < 2:
+        return []
+
+    try:
+        needle = literal.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return []
+
+    mask = b"\xff" * len(needle)
+    search_flags = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
+
+    min_ea = compat.inf_get_min_ea()
+    max_ea = compat.inf_get_max_ea()
+
+    results: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    ea = min_ea
+
+    while len(results) < max_count:
+        hit = compat.raw_bin_search(ea, max_ea, needle, mask, search_flags)
+        if hit == idaapi.BADADDR:
+            break
+
+        str_start = _find_encoded_string_start(hit, char_size)
+        if str_start not in seen:
+            seen.add(str_start)
+
+            # Try decoding the full string from the backward-scan start.
+            # If that fails (str_start landed inside code with invalid byte
+            # sequences), fall back to reading forward from the literal hit.
+            report_ea = str_start
+            text: str | None = None
+
+            content = _read_null_terminated_encoded(str_start, char_size)
+            if content:
+                try:
+                    text = content.decode(encoding)
+                except (UnicodeDecodeError, ValueError):
+                    pass
+
+            if text is None and str_start != hit:
+                # str_start is probably inside non-string bytes; the hit
+                # address itself is a safe fallback since we know the needle
+                # is there.
+                content = _read_null_terminated_encoded(hit, char_size)
+                if content:
+                    try:
+                        text = content.decode(encoding)
+                        report_ea = hit
+                        seen.add(hit)
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+
+            if text is not None and regex.search(text):
+                results.append((report_ea, text))
+
+        ea = hit + char_size  # advance past current hit
+
+    return results
 
 
 def init_caches():
@@ -846,28 +1061,89 @@ def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
     limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    mode: Annotated[
+        str,
+        (
+            'Encoding to search. "UTF-8" (default) searches the IDA ASCII/UTF-8 string '
+            'cache. "UTF-16LE" searches wide strings (Windows, Unreal Engine). '
+            '"UTF-32LE" searches 4-byte wide strings. '
+            '"windows-1252" searches single-byte ANSI strings using the Windows-1252 '
+            'codepage. "All" searches every encoding and merges the results.'
+        ),
+    ] = "UTF-8",
 ) -> FindRegexResult:
-    """Search strings by case-insensitive regex with offset/limit pagination."""
+    """Search strings by case-insensitive regex with offset/limit pagination.
+
+    Use ``mode`` to target the encoding used by strings in the binary:
+
+    * ``"UTF-8"`` (default) – searches IDA's built-in ASCII/UTF-8 string cache.
+      Fast and sufficient for most ELF/Mach-O binaries.
+    * ``"UTF-16LE"`` – binary-scans for wide strings (2-byte chars).  Essential
+      for Windows PE files and Unreal Engine binaries where all ``TCHAR*``/
+      ``FString`` literals are UTF-16LE.
+    * ``"UTF-32LE"`` – binary-scans for 4-byte-char wide strings.
+    * ``"windows-1252"`` – binary-scans for single-byte ANSI strings encoded in
+      the Windows-1252 code page (covers high bytes 0x80-0xFF not in ASCII).
+    * ``"All"`` – runs every encoding and merges the results (deduplicates by
+      address, sorts by address ascending).
+    """
     if limit <= 0:
         limit = 30
     if limit > 500:
         limit = 500
 
-    matches = []
+    mode = (mode or "UTF-8").strip()
+    valid_modes = {"UTF-8", "UTF-16LE", "UTF-32LE", "windows-1252", "All"}
+    if mode not in valid_modes:
+        return {
+            "n": 0,
+            "matches": [],
+            "cursor": {"done": True},
+            "error": f"Unknown mode {mode!r}. Valid modes: {sorted(valid_modes)}",
+        }
+
     regex = re.compile(pattern, re.IGNORECASE)
-    strings = _get_strings_cache()
+    need = offset + limit + 1  # collect one extra to detect "more"
+
+    def _utf8_matches() -> list[tuple[int, str]]:
+        return [
+            (ea, text) for ea, text in _get_strings_cache() if regex.search(text)
+        ]
+
+    def _encoded_matches(enc_mode: str) -> list[tuple[int, str]]:
+        codec, char_size = _ENCODING_CONFIGS[enc_mode]
+        return _search_encoded(regex, codec, char_size, need)
+
+    if mode == "UTF-8":
+        all_matches: list[tuple[int, str]] = _utf8_matches()
+    elif mode in _ENCODING_CONFIGS:
+        all_matches = _encoded_matches(mode)
+    else:  # "All"
+        seen: set[int] = set()
+        merged: list[tuple[int, str]] = []
+        for ea, text in _utf8_matches():
+            if ea not in seen:
+                seen.add(ea)
+                merged.append((ea, text))
+        for enc_mode in _ENCODING_CONFIGS:
+            for ea, text in _encoded_matches(enc_mode):
+                if ea not in seen:
+                    seen.add(ea)
+                    merged.append((ea, text))
+        merged.sort(key=lambda t: t[0])
+        all_matches = merged
 
     skipped = 0
+    matches = []
     more = False
-    for ea, text in strings:
-        if regex.search(text):
-            if skipped < offset:
-                skipped += 1
-                continue
-            if len(matches) >= limit:
-                more = True
-                break
-            matches.append({"addr": hex(ea), "string": text})
+    for ea, text in all_matches:
+        if skipped < offset:
+            skipped += 1
+            continue
+        if len(matches) >= limit:
+            more = True
+            break
+        matches.append({"addr": hex(ea), "string": text})
 
     return {
         "n": len(matches),

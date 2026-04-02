@@ -23,6 +23,7 @@ venv*/
 *.til
 *.elf
 !tests/typed_fixture.elf
+!tests/wide_fixture.elf
 
 # Generated server files
 server_generated.py
